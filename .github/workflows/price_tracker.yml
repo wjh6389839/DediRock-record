@@ -2,12 +2,12 @@ name: Daily VPS Price Tracker
 
 on:
   schedule:
-    # 每天 UTC 02:00 运行 (对应北京时间 10:00)
+    # 每天 UTC 02:00 (北京时间 10:00) 运行
     - cron: '0 2 * * *'
-  workflow_dispatch: # 允许在 GitHub 网页上手动点击按钮立即执行
+  workflow_dispatch:
 
 permissions:
-  contents: write # 明确授予写权限以便推送 CSV 和 PNG
+  contents: write
 
 jobs:
   track-and-update:
@@ -27,7 +27,9 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: 4. 执行监控与绘图脚本
+      - name: 4. 执行监控与微信推送逻辑
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }} # 读取 GitHub Secret 传入脚本
         run: |
           python tracker.py
 
@@ -36,7 +38,6 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add price_history.csv price_trend.png
-          # 仅当文件有变化时才执行 commit，避免空提交报错
           if ! git diff --staged --quiet; then
             git commit -m "Auto: Update price data & trend chart [$(date +'%Y-%m-%d')]"
             git push
