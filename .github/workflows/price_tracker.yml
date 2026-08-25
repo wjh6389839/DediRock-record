@@ -2,37 +2,44 @@ name: Daily VPS Price Tracker
 
 on:
   schedule:
-    # 每天 UTC 02:00 (北京时间 10:00) 自动触发
+    # 每天 UTC 02:00 运行 (对应北京时间 10:00)
     - cron: '0 2 * * *'
-  workflow_dispatch: # 允许你在 GitHub 页面手动点击运行测试
+  workflow_dispatch: # 允许在 GitHub 网页上手动点击按钮立即执行
 
 permissions:
-  contents: write # 授予自动提交并推送代码的写权限
+  contents: write # 明确授予写权限以便推送 CSV 和 PNG
 
 jobs:
-  track:
+  track-and-update:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: 1. 检出代码仓库
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 2. 安装 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: 3. 安装依赖包
         run: |
-          pip install requests beautifulsoup4 pandas matplotlib
+          pip install -r requirements.txt
 
-      - name: Run Tracker
+      - name: 4. 执行监控与绘图脚本
         run: |
           python tracker.py
 
-      - name: Commit and push if changed
+      - name: 5. 提交最新数据与图表回仓库
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add price_history.csv price_trend.png
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto: update price history and trend chart" && git push)
+          # 仅当文件有变化时才执行 commit，避免空提交报错
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto: Update price data & trend chart [$(date +'%Y-%m-%d')]"
+            git push
+          else
+            echo "数据未发生变化，无需提交。"
+          fi
