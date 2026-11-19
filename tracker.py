@@ -4,61 +4,44 @@ import csv
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from playwright.sync_api import sync_playwright
 
 TARGET_URL = "https://billing.dedirock.com/index.php/store/promo-vps-los-angeles"
 CSV_FILE = "price_history.csv"
 CHART_FILE = "price_trend.png"
-TZ = ZoneInfo("America/Los_Angeles")  # 按需调整，例如 "Asia/Shanghai" 或 "UTC"
+TZ = ZoneInfo("America/Los_Angeles")  # 可按需改为 "Asia/Shanghai" 或 "UTC"
 
 # 从 GitHub Actions 注入的环境变量中读取 SendKey
 SERVERCHAN_SENDKEY = os.getenv("SERVERCHAN_SENDKEY")
 
 
 def now_tz():
+    """返回指定时区的当前时间"""
     return datetime.now(TZ)
 
 
-def create_scraper():
-    scraper = cloudscraper.create_scraper(
-        browser={
-            "browser": "chrome",
-            "platform": "windows",
-            "desktop": True,
-        }
-    )
-    scraper.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://billing.dedirock.com/",
-        "Upgrade-Insecure-Requests": "1",
-    })
-    return scraper
-
-
 def extract_price_from_html(html: str):
-    """优先从解析后的可见文本提取价格，减少匹配到源码/隐藏元素的概率"""
+    """从渲染后的可见文本中提取价格"""
     soup = BeautifulSoup(html, "html.parser")
 
-    # 移除 script / style / noscript
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
     visible_text = soup.get_text(" ", strip=True)
 
-    # 优先匹配带货币单位或计费周期的价格，例如 $12.00 USD / $9.99/yr
-    candidates = re.findall(r'(?<!\w)\$(\d+\.\d{2})(?:\s*(?:USD|/yr|/mo|per\s+year|annually))?', visible_text, flags=re.IGNORECASE)
+    # 优先匹配带货币单位或计费周期的价格
+    candidates = re.findall(
+        r'(?<!\w)\$(\d+\.\d{2})(?:\s*(?:USD|/yr|/mo|per\s+year|annually))?',
+        visible_text,
+        flags=re.IGNORECASE,
+    )
     if not candidates:
         candidates = re.findall(r'(?<!\w)\$(\d+\.\d{2})', visible_text)
 
@@ -68,35 +51,58 @@ def extract_price_from_html(html: str):
         if p > 0:
             prices.append(p)
 
-    # 若页面有多个套餐价格，通常促销页展示的 VPS 价格里取最小值或首个有效价格（可根据实际页面调整）
     return min(prices) if prices else None
 
 
 def get_current_price(retries: int = 3):
-    """抓取页面价格（带重试与反爬绕过）"""
-    scraper = create_scraper()
-
+    """使用 Playwright 真浏览器抓取页面价格"""
     for attempt in range(1, retries + 1):
         try:
-            resp = scraper.get(TARGET_URL, timeout=25)
-            if resp.status_code == 403:
-                print(f"[第 {attempt}/{retries} 次尝试] 仍收到 403 Forbidden（可能触发了 Cloudflare JS 质询）。")
-                if "Just a moment" in resp.text or "cf-browser-verification" in resp.text:
-                    print("检测到 Cloudflare 质询页，纯 HTTP 客户端可能无法通过。")
-            resp.raise_for_status()
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-US",
+                )
+                context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
+                page = context.new_page()
+                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45000)
 
-            price = extract_price_from_html(resp.text)
+                # 等待 Cloudflare 质询页跳转完成（最多约 15 秒）
+                for _ in range(15):
+                    title = page.title()
+                    html = page.content()
+                    if "Just a moment" not in title and "cf-browser-verification" not in html:
+                        break
+                    time.sleep(1)
+
+                # 等待动态内容渲染
+                page.wait_for_timeout(3000)
+                html = page.content()
+                browser.close()
+
+            price = extract_price_from_html(html)
             if price is not None:
                 print(f"[{now_tz().strftime('%Y-%m-%d %H:%M:%S')}] 抓取到最新价格: ${price:.2f}")
                 return price
 
-            print(f"[第 {attempt}/{retries} 次尝试] 页面已请求成功，但未能匹配到有效价格。")
-            print("页面片段预览:", re.sub(r"\s+", " ", resp.text)[:300])
+            print(f"[第 {attempt}/{retries} 次尝试] 页面已加载，但未匹配到有效价格。")
+            print("页面片段预览:", re.sub(r"\s+", " ", html)[:300])
         except Exception as e:
-            print(f"[第 {attempt}/{retries} 次尝试] 网页抓取失败: {e}")
+            print(f"[第 {attempt}/{retries} 次尝试] Playwright 抓取失败: {e}")
 
         if attempt < retries:
-            time.sleep(3 * attempt)
+            time.sleep(4 * attempt)
 
     return None
 
@@ -146,7 +152,7 @@ def send_wechat_push(title, desp):
     api_url = f"https://sctapi.ftqq.com/{SERVERCHAN_SENDKEY}.send"
     payload = {
         "title": title,
-        "desp": desp
+        "desp": desp,
     }
     try:
         resp = requests.post(api_url, data=payload, timeout=15)
@@ -196,9 +202,35 @@ def render_chart():
     plt.figure(figsize=(10, 5), dpi=180)
     plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
 
-    plt.plot(df['date'], df['price'], marker='o', markersize=5, color='#1d4ed8', linewidth=2.2, label='Daily Price ($ USD)', zorder=3)
-    plt.axhline(y=min_price, color='#15803d', linestyle='--', linewidth=1.5, alpha=0.8, label=f'All-time Low: ${min_price:.2f}', zorder=2)
-    plt.scatter(min_records['date'], min_records['price'], color='#dc2626', s=110, zorder=5, edgecolors='black', linewidth=1.2, label='Lowest Point')
+    plt.plot(
+        df['date'],
+        df['price'],
+        marker='o',
+        markersize=5,
+        color='#1d4ed8',
+        linewidth=2.2,
+        label='Daily Price ($ USD)',
+        zorder=3,
+    )
+    plt.axhline(
+        y=min_price,
+        color='#15803d',
+        linestyle='--',
+        linewidth=1.5,
+        alpha=0.8,
+        label=f'All-time Low: ${min_price:.2f}',
+        zorder=2,
+    )
+    plt.scatter(
+        min_records['date'],
+        min_records['price'],
+        color='#dc2626',
+        s=110,
+        zorder=5,
+        edgecolors='black',
+        linewidth=1.2,
+        label='Lowest Point',
+    )
 
     for _, row in min_records.iterrows():
         plt.annotate(
@@ -210,10 +242,15 @@ def render_chart():
             fontsize=9.5,
             fontweight='bold',
             color='#b91c1c',
-            bbox=dict(boxstyle="round,pad=0.25", fc="#fee2e2", ec="#ef4444", lw=0.8)
+            bbox=dict(boxstyle="round,pad=0.25", fc="#fee2e2", ec="#ef4444", lw=0.8),
         )
 
-    plt.title(f"DediRock LA VPS Price Trend\nLatest: ${latest_row['price']:.2f} | All-time Lowest: ${min_price:.2f}", fontsize=12, fontweight='bold', pad=12)
+    plt.title(
+        f"DediRock LA VPS Price Trend\nLatest: ${latest_row['price']:.2f} | All-time Lowest: ${min_price:.2f}",
+        fontsize=12,
+        fontweight='bold',
+        pad=12,
+    )
     plt.xlabel("Date", fontsize=10, labelpad=8)
     plt.ylabel("Price ($ USD)", fontsize=10, labelpad=8)
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
