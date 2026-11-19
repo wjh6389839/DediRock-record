@@ -27,6 +27,10 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: 安装 Playwright 浏览器
+        run: |
+          playwright install --with-deps chromium    
+
       - name: 4. 执行监控与微信推送逻辑
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }} # 读取 GitHub Secret 传入脚本
